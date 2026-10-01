@@ -3698,6 +3698,59 @@
                 pages[currentComicPageIndex] = scene
               }
 
+              function scaleScenePaneData(paneData, scale, offsetX, offsetY, sourceSize, targetSize) {
+                const scaledPane = { ...paneData }
+                const scaleObject = object => {
+                  if (!object) return object
+                  const scaled = { ...object }
+                  if (typeof scaled.x === 'number') scaled.x = scaled.x * scale + offsetX
+                  if (typeof scaled.y === 'number') scaled.y = scaled.y * scale + offsetY
+
+                  for (const key of ['width', 'height', 'scale', 'lineWidth', 'borderWidth', 'fontSize']) {
+                    if (typeof scaled[key] === 'number') scaled[key] *= scale
+                  }
+                  for (const key of ['tailStartX', 'tailEndX']) {
+                    if (typeof scaled[key] === 'number') scaled[key] = scaled[key] * scale + offsetX
+                  }
+                  for (const key of ['tailStartY', 'tailEndY']) {
+                    if (typeof scaled[key] === 'number') scaled[key] = scaled[key] * scale + offsetY
+                  }
+
+                  if (scaled.origin) {
+                    scaled.origin = {
+                      x: scaled.origin.x * scale + offsetX,
+                      y: scaled.origin.y * scale + offsetY
+                    }
+                  }
+                  if (scaled.joints) {
+                    scaled.joints = Object.fromEntries(
+                      Object.entries(scaled.joints).map(([name, joint]) => [name, {
+                        x: joint.x * scale + offsetX,
+                        y: joint.y * scale + offsetY
+                      }])
+                    )
+                  }
+                  if (Array.isArray(scaled.eraseStrokes)) {
+                    const strokeScale = scale * Math.min(sourceSize.width, sourceSize.height) /
+                      Math.min(targetSize.width, targetSize.height)
+                    scaled.eraseStrokes = scaled.eraseStrokes.map(stroke => ({
+                      ...stroke,
+                      radius: stroke.radius * strokeScale,
+                      points: (stroke.points || []).map(point => ({
+                        x: (point.x * sourceSize.width * scale + offsetX) / targetSize.width,
+                        y: (point.y * sourceSize.height * scale + offsetY) / targetSize.height
+                      }))
+                    }))
+                  }
+                  return scaled
+                }
+
+                for (const key of ['figures', 'labels', 'insertedImages', 'speechBubbles', 'comicTexts', 'effects', 'insetPanels']) {
+                  if (Array.isArray(scaledPane[key])) scaledPane[key] = scaledPane[key].map(scaleObject)
+                }
+                return scaledPane
+              }
+
               function loadPageImages(index) {
                 const pageEntry = pages[index]
 
@@ -3737,7 +3790,10 @@
                     img.onload = () => {
                       const pane = panes[i]
                       pane.ctx.clearRect(0, 0, pane.canvas.width, pane.canvas.height)
-                      pane.ctx.drawImage(img, 0, 0, pane.canvas.width, pane.canvas.height)
+                      const scale = Math.min(pane.canvas.width / img.width, pane.canvas.height / img.height)
+                      const width = img.width * scale
+                      const height = img.height * scale
+                      pane.ctx.drawImage(img, (pane.canvas.width - width) / 2, (pane.canvas.height - height) / 2, width, height)
                     }
                     img.src = src
                   })
@@ -3746,6 +3802,23 @@
 
                 // If pageEntry is a scene object, deserialize editable objects
                 if (pageEntry && pageEntry.type === 'scene' && Array.isArray(pageEntry.panes)) {
+                  const sourceSize = pageEntry.paneSize
+                  const targetSize = {
+                    width: panes[0].canvas.width,
+                    height: panes[0].canvas.height
+                  }
+                  let sceneScale = 1
+                  let offsetX = 0
+                  let offsetY = 0
+                  if (sourceSize && sourceSize.width > 0 && sourceSize.height > 0) {
+                    sceneScale = Math.min(
+                      panes[0].canvas.width / sourceSize.width,
+                      panes[0].canvas.height / sourceSize.height
+                    )
+                    offsetX = (panes[0].canvas.width - sourceSize.width * sceneScale) / 2
+                    offsetY = (panes[0].canvas.height - sourceSize.height * sceneScale) / 2
+                  }
+
                   // Clear existing editable state
                   panes.forEach(p => {
                     p.figures = []
@@ -3953,7 +4026,10 @@
                   // deserialize each pane
                   pageEntry.panes.forEach((pd, i) => {
                     const pane = panes[i]
-                    deserializePaneData(pd, pane)
+                    const scaledPaneData = sourceSize
+                      ? scaleScenePaneData(pd, sceneScale, offsetX, offsetY, sourceSize, targetSize)
+                      : pd
+                    deserializePaneData(scaledPaneData, pane)
                   })
 
                   // redrawing after deserialization
@@ -13744,20 +13820,26 @@
               redrawAllPanes()
               updateButtonVisibility()
 
-              // ---- Auto-detect a comic project file in the same folder ----
-              // If "comic.json" sits alongside this HTML file, offer to load
-              // it as a starting point. Silently does nothing if the file
-              // isn't there, isn't valid, or if the browser blocks the
-              // fetch (e.g. when the page is opened directly via file://).
+              // ---- Auto-detect a comic project file at startup ----
+              // Check the served project root first, then the HTML folder.
               ;(async function tryLoadComicProject() {
                 let response
-                try {
-                  response = await fetch('comic.json', { cache: 'no-store' })
-                } catch (err) {
-                  // Network error, CORS block, or file:// — quietly skip.
-                  return
+                const comicUrls = [
+                  new URL('/comic.json', window.location.href).href,
+                  new URL('comic.json', window.location.href).href
+                ]
+                for (const url of comicUrls) {
+                  try {
+                    const candidate = await fetch(url, { cache: 'no-store' })
+                    if (candidate.ok) {
+                      response = candidate
+                      break
+                    }
+                  } catch (err) {
+                    // Try the next location if this request is blocked.
+                  }
                 }
-                if (!response || !response.ok) return
+                if (!response) return
 
                 let text
                 try {
